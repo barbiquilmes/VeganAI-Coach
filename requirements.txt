@@ -8,3 +8,6 @@ uvicorn
 python-dotenv
 tiktoken
 pypdf
+sqlalchemy
+alembic
+psycopg2-binary
