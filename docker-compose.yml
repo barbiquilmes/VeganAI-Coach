@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  veganai-coach:
+    build: .
+    container_name: veganai-coach
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env  # Load environment variables from .env file
+    volumes:
+      # Mount .env file to ensure it's always up-to-date
+      - ./.env:/app/.env:ro
+      # Mount database directory to persist data
+      - ./veganai.db:/app/veganai.db
+      - ./chroma_db:/app/chroma_db
+    restart: unless-stopped
+
