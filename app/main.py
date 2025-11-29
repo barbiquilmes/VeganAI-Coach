@@ -1,9 +1,34 @@
 import os
+import time
+import logging
 from typing import List
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
+
+# Configurar logging para que se vea en Docker (sin buffering)
+import sys
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)  # Forzar stdout sin buffering
+    ],
+    force=True  # Forzar reconfiguración
+)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+# También configurar uvicorn para que muestre nuestros logs
+logging.getLogger("uvicorn").setLevel(logging.INFO)
+
+# Función helper para forzar flush
+def log_and_flush(message, level="info"):
+    if level == "info":
+        logger.info(message)
+    elif level == "error":
+        logger.error(message)
+    sys.stdout.flush()  # Forzar flush inmediato
 
 # LangChain imports
 from langchain_chroma import Chroma
@@ -37,10 +62,20 @@ class QueryRequest(BaseModel):
     question: str
 
 # Configuración Global (se carga al arrancar)
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+# Agregar timeouts para evitar que se cuelgue
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small",
+    timeout=30,  # 30 segundos timeout para embeddings
+    max_retries=2
+)
 vector_store = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
 retriever = vector_store.as_retriever(search_kwargs={"k": 2})
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+llm = ChatOpenAI(
+    model="gpt-4o-mini", 
+    temperature=0,
+    timeout=60,  # 60 segundos timeout para LLM
+    max_retries=2
+)
 
 # Prompt Sarcástico
 system_prompt = (
@@ -182,11 +217,63 @@ def delete_goal(
 @app.post("/ask", tags=["recipes"])
 def ask_chef(request: QueryRequest):
     """Endpoint para preguntar al chef (existing RAG functionality)"""
+    start_time = time.time()
+    
+    # Usar print con flush para asegurar que se vea en Docker
+    print("=" * 60, flush=True)
+    print(f"[ASK] INICIANDO - Pregunta: {request.question[:100]}", flush=True)
+    print("=" * 60, flush=True)
+    
     try:
-        response = chain.invoke({"input": request.question})
+        # Medir embedding por separado
+        embedding_start = time.time()
+        print(f"[ASK] Paso 1: Generando embedding...", flush=True)
+        question_embedding = embeddings.embed_query(request.question)
+        embedding_time = time.time() - embedding_start
+        print(f"[ASK] ✓ Embedding completado en {embedding_time:.2f}s", flush=True)
+        
+        # Medir búsqueda en ChromaDB
+        search_start = time.time()
+        print(f"[ASK] Paso 2: Buscando en ChromaDB...", flush=True)
+        docs = retriever.invoke(request.question)
+        search_time = time.time() - search_start
+        print(f"[ASK] ✓ Búsqueda completada en {search_time:.2f}s - {len(docs)} documentos", flush=True)
+        
+        # Medir generación LLM
+        llm_start = time.time()
+        print(f"[ASK] Paso 3: Generando respuesta con LLM...", flush=True)
+        # Crear prompt con contexto
+        context = "\n\n".join([doc.page_content for doc in docs])
+        prompt = prompt_template.format_messages(context=context, input=request.question)
+        llm_response = llm.invoke(prompt)
+        llm_time = time.time() - llm_start
+        print(f"[ASK] ✓ LLM completado en {llm_time:.2f}s", flush=True)
+        
+        total_time = time.time() - start_time
+        
+        # Log timing information
+        print("=" * 60, flush=True)
+        print(f"[ASK] COMPLETADO en {total_time:.2f}s total:", flush=True)
+        print(f"  - Embedding: {embedding_time:.2f}s", flush=True)
+        print(f"  - Búsqueda: {search_time:.2f}s", flush=True)
+        print(f"  - LLM: {llm_time:.2f}s", flush=True)
+        print("=" * 60, flush=True)
+        
         return {
-            "answer": response["answer"],
-            "source_used": [doc.page_content[:50] for doc in response["context"]]
+            "answer": llm_response.content if hasattr(llm_response, 'content') else str(llm_response),
+            "source_used": [doc.page_content[:50] for doc in docs],
+            "timing_seconds": round(total_time, 2),
+            "timing_breakdown": {
+                "embedding": round(embedding_time, 2),
+                "search": round(search_time, 2),
+                "llm": round(llm_time, 2)
+            }
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        elapsed = time.time() - start_time
+        print(f"[ASK] ❌ ERROR después de {elapsed:.2f}s:", flush=True)
+        print(f"  Error: {str(e)}", flush=True)
+        print(f"  Tipo: {type(e).__name__}", flush=True)
+        import traceback
+        print(f"  Traceback: {traceback.format_exc()}", flush=True)
+        raise HTTPException(status_code=500, detail=f"Error procesando pregunta: {str(e)}")
